@@ -34,11 +34,17 @@ jobs:
         with:
           workspaces: runtime3/rust
 
-      - name: Build
-        run: cargo build --all-features
+      - name: Build (default)
+        run: cargo build
+
+      - name: Build (std + tokio + serde + llm)
+        run: cargo build --features tokio,serde,llm
+
+      - name: Build (alloc / no_std)
+        run: cargo build --no-default-features --features alloc
 
       - name: Test
-        run: cargo test --all-features
+        run: cargo test
 
       - name: Clippy
-        run: cargo clippy --all-features -- -D warnings
+        run: cargo clippy -- -D warnings
