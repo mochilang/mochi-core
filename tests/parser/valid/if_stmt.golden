@@ -1,0 +1,11 @@
+(program
+  (if
+    (binary > (selector x) (int 0))
+    (block
+      (call print (string positive))
+    )
+    (block
+      (call print (string non-positive))
+    )
+  )
+)

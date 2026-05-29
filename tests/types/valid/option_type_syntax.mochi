@@ -1,0 +1,4 @@
+// MEP-10 C1: `T?` desugars to `option[T]`. A none literal flows
+// into an option-typed slot without an explicit cast.
+let maybe: int? = none
+expect maybe == none

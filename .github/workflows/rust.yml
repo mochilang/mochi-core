@@ -1,0 +1,44 @@
+name: Rust
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+
+    defaults:
+      run:
+        working-directory: runtime3/rust
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read toolchain
+        id: toolchain
+        shell: bash
+        run: echo "channel=$(grep '^channel' rust-toolchain.toml | sed 's/.*= //' | tr -d '\"')" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: runtime3/rust
+
+      - name: Build
+        run: cargo build --all-features
+
+      - name: Test
+        run: cargo test --all-features
+
+      - name: Clippy
+        run: cargo clippy --all-features -- -D warnings

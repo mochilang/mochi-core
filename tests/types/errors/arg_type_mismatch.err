@@ -1,0 +1,8 @@
+1. error[T008]: type mismatch: expected int, got string
+  --> tests/types/errors/arg_type_mismatch.mochi:5:8
+
+  5 | square("hi")
+    |        ^
+
+help:
+  Change the value to match the expected type.

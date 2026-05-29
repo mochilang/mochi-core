@@ -1,0 +1,12 @@
+(program
+  (type Id
+    (alias (type int))
+  )
+  (type Name
+    (alias (type string))
+  )
+  (type Pair
+    (field first (type int))
+    (field second (type int))
+  )
+)

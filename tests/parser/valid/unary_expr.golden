@@ -1,0 +1,8 @@
+(program
+  (let neg
+    (unary - (int 1))
+  )
+  (let inv
+    (unary ! (bool true))
+  )
+)

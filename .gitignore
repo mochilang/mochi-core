@@ -1,0 +1,11 @@
+# Go
+*.test
+*.out
+/vendor/
+
+# Rust
+/runtime3/rust/target/
+
+# OS
+.DS_Store
+Thumbs.db

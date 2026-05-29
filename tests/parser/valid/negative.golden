@@ -1,0 +1,14 @@
+(program
+  (let x
+    (binary +
+      (unary - (int 1))
+      (int 2)
+    )
+  )
+  (var y
+    (binary *
+      (unary - (int 3))
+      (int 4)
+    )
+  )
+)

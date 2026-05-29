@@ -1,0 +1,271 @@
+package types
+
+import (
+	"mochi/parser"
+
+	"github.com/alecthomas/participle/v2/lexer"
+)
+
+// parseDeclaredEffects converts the raw label list on FunStmt.Effects
+// into a typed EffectSet. Each unknown label produces a T064
+// diagnostic but the parse keeps going so the caller sees every bad
+// label in one pass.
+func parseDeclaredEffects(fn *parser.FunStmt) (EffectSet, []error) {
+	return parseEffectLabels(fn.Pos, fn.Effects)
+}
+
+// parseFunExprEffects mirrors parseDeclaredEffects for anonymous
+// function expressions. MEP-15 Stage 3b extends T064 to FunExpr.
+func parseFunExprEffects(f *parser.FunExpr) (EffectSet, []error) {
+	return parseEffectLabels(f.Pos, f.Effects)
+}
+
+func parseEffectLabels(pos lexer.Position, labels []string) (EffectSet, []error) {
+	var set EffectSet
+	var errs []error
+	for _, name := range labels {
+		label, ok := ParseEffectLabel(name)
+		if !ok {
+			errs = append(errs, errUnknownEffectLabel(pos, name))
+			continue
+		}
+		set = set.Add(label)
+	}
+	return set, errs
+}
+
+// inferFunctionEffects walks fn's body and returns the union of
+// effect labels carried by each call and statement-level construct it
+// reaches. MEP-15 Stage 2: replaces the boolean legacyEffectsFromPure
+// bridge with real propagation.
+//
+// Forward references rely on the caller running this in a fixpoint:
+// callees not yet registered contribute EmptyEffects on the first
+// sweep; later sweeps pick up the missing labels. The lattice is
+// finite (one bit per label) so the fixpoint terminates in at most
+// effectMax rounds across any dependency chain.
+func inferFunctionEffects(fn *parser.FunStmt, env *Env) EffectSet {
+	if fn == nil {
+		return EmptyEffects
+	}
+	child := funBodyEnv(env, fn.Params)
+	var effs EffectSet
+	for _, stmt := range fn.Body {
+		effs = effs.Union(stmtEffects(stmt, child))
+	}
+	return effs
+}
+
+// inferFunExprEffects walks the body of an anonymous function and
+// returns the union of effect labels reachable from it. ExprBody and
+// BlockBody are handled symmetrically so `fun(x) => print(x)` and the
+// equivalent block produce the same set.
+func inferFunExprEffects(f *parser.FunExpr, env *Env) EffectSet {
+	if f == nil {
+		return EmptyEffects
+	}
+	child := funBodyEnv(env, f.Params)
+	var effs EffectSet
+	if f.ExprBody != nil {
+		effs = effs.Union(exprEffects(f.ExprBody, child))
+	}
+	for _, stmt := range f.BlockBody {
+		effs = effs.Union(stmtEffects(stmt, child))
+	}
+	return effs
+}
+
+func funBodyEnv(env *Env, params []*parser.Param) *Env {
+	child := NewEnv(env)
+	for _, p := range params {
+		if p.Type != nil {
+			child.SetVar(p.Name, resolveTypeRef(p.Type, env), false)
+		} else {
+			child.SetVar(p.Name, AnyType{}, false)
+		}
+	}
+	return child
+}
+
+// stmtEffects returns the effects produced by evaluating s in env. The
+// helper mirrors the structure of statementHasImpureCall but tracks
+// the typed set rather than a boolean. Nested control-flow bodies are
+// walked so a `print` inside an `if` branch surfaces at the function
+// boundary.
+func stmtEffects(s *parser.Statement, env *Env) EffectSet {
+	if s == nil {
+		return EmptyEffects
+	}
+	var e EffectSet
+	switch {
+	case s.Let != nil:
+		e = exprEffects(s.Let.Value, env)
+	case s.Var != nil:
+		e = exprEffects(s.Var.Value, env)
+	case s.Assign != nil:
+		e = exprEffects(s.Assign.Value, env)
+		for _, idx := range s.Assign.Index {
+			e = e.Union(exprEffects(idx.Start, env)).Union(exprEffects(idx.End, env))
+		}
+	case s.Return != nil:
+		e = exprEffects(s.Return.Value, env)
+	case s.Expr != nil:
+		e = exprEffects(s.Expr.Expr, env)
+	case s.If != nil:
+		e = ifEffects(s.If, env)
+	case s.While != nil:
+		e = exprEffects(s.While.Cond, env)
+		for _, b := range s.While.Body {
+			e = e.Union(stmtEffects(b, env))
+		}
+	case s.For != nil:
+		e = exprEffects(s.For.Source, env).Union(exprEffects(s.For.RangeEnd, env))
+		for _, b := range s.For.Body {
+			e = e.Union(stmtEffects(b, env))
+		}
+	case s.Update != nil:
+		if s.Update.Where != nil {
+			e = e.Union(exprEffects(s.Update.Where, env))
+		}
+		if s.Update.Set != nil {
+			for _, it := range s.Update.Set.Items {
+				e = e.Union(exprEffects(it.Value, env))
+			}
+		}
+	case s.Fetch != nil:
+		e = NewEffectSet(EffectNet)
+		e = e.Union(exprEffects(s.Fetch.URL, env)).Union(exprEffects(s.Fetch.With, env))
+	}
+	return e
+}
+
+func ifEffects(i *parser.IfStmt, env *Env) EffectSet {
+	if i == nil {
+		return EmptyEffects
+	}
+	e := exprEffects(i.Cond, env)
+	for _, b := range i.Then {
+		e = e.Union(stmtEffects(b, env))
+	}
+	if i.ElseIf != nil {
+		e = e.Union(ifEffects(i.ElseIf, env))
+	}
+	for _, b := range i.Else {
+		e = e.Union(stmtEffects(b, env))
+	}
+	return e
+}
+
+func exprEffects(e *parser.Expr, env *Env) EffectSet {
+	if e == nil || e.Binary == nil {
+		return EmptyEffects
+	}
+	eff := unaryEffects(e.Binary.Left, env)
+	for _, op := range e.Binary.Right {
+		eff = eff.Union(unaryEffects(op.Right, env))
+	}
+	return eff
+}
+
+func unaryEffects(u *parser.Unary, env *Env) EffectSet {
+	if u == nil {
+		return EmptyEffects
+	}
+	return postfixEffects(u.Value, env)
+}
+
+func postfixEffects(p *parser.PostfixExpr, env *Env) EffectSet {
+	if p == nil {
+		return EmptyEffects
+	}
+	eff := primaryEffects(p.Target, env)
+	for _, op := range p.Ops {
+		if op.Call != nil {
+			for _, a := range op.Call.Args {
+				eff = eff.Union(exprEffects(a, env)).Union(callableEffects(a, env))
+			}
+			if p.Target != nil && p.Target.Selector != nil && len(p.Target.Selector.Tail) == 0 {
+				if t, err := env.GetVar(p.Target.Selector.Root); err == nil {
+					if ft, ok := t.(FuncType); ok {
+						eff = eff.Union(ft.Effects)
+					}
+				}
+			}
+		}
+		if op.Index != nil {
+			eff = eff.Union(exprEffects(op.Index.Start, env)).Union(exprEffects(op.Index.End, env))
+		}
+	}
+	return eff
+}
+
+func primaryEffects(p *parser.Primary, env *Env) EffectSet {
+	if p == nil {
+		return EmptyEffects
+	}
+	switch {
+	case p.Call != nil:
+		var eff EffectSet
+		if t, err := env.GetVar(p.Call.Func); err == nil {
+			if ft, ok := t.(FuncType); ok {
+				eff = ft.Effects
+			}
+		}
+		for _, a := range p.Call.Args {
+			eff = eff.Union(exprEffects(a, env)).Union(callableEffects(a, env))
+		}
+		return eff
+	case p.Group != nil:
+		return exprEffects(p.Group, env)
+	case p.Fetch != nil:
+		return NewEffectSet(EffectNet)
+	case p.Load != nil:
+		return NewEffectSet(EffectFS)
+	case p.Save != nil:
+		return NewEffectSet(EffectFS)
+	}
+	return EmptyEffects
+}
+
+// callableEffects returns the effect set that would be incurred by
+// *calling* the value produced by e, as opposed to merely evaluating
+// it. Constructing a closure is pure; calling it may not be.
+//
+// The function recognises two "bare callable" forms:
+//   - a FunExpr literal with no surrounding operators → infer its body effects
+//   - a plain identifier (Selector with no field tail) of function type
+//     → return the FuncType.Effects already recorded in env
+//
+// Any other expression shape returns EmptyEffects. This is a deliberate
+// conservative choice: we only propagate effects we can see statically.
+// Indirect dispatch through complex expressions is left to the call site
+// that actually invokes the stored value.
+func callableEffects(e *parser.Expr, env *Env) EffectSet {
+	if e == nil || e.Binary == nil {
+		return EmptyEffects
+	}
+	// Only the "bare" case: no binary ops, no unary ops, no postfix ops.
+	b := e.Binary
+	if len(b.Right) > 0 {
+		return EmptyEffects
+	}
+	u := b.Left
+	if u == nil || len(u.Ops) > 0 || u.Value == nil || len(u.Value.Ops) > 0 {
+		return EmptyEffects
+	}
+	p := u.Value.Target
+	if p == nil {
+		return EmptyEffects
+	}
+	switch {
+	case p.FunExpr != nil:
+		return inferFunExprEffects(p.FunExpr, env)
+	case p.Selector != nil && len(p.Selector.Tail) == 0:
+		if t, err := env.GetVar(p.Selector.Root); err == nil {
+			if ft, ok := t.(FuncType); ok {
+				return ft.Effects
+			}
+		}
+	}
+	return EmptyEffects
+}

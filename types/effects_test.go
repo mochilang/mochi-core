@@ -1,0 +1,394 @@
+package types_test
+
+import (
+	"mochi/parser"
+	"mochi/types"
+	"testing"
+
+	"github.com/alecthomas/participle/v2/lexer"
+)
+
+func TestEffectSet_Basics(t *testing.T) {
+	if !types.EmptyEffects.IsEmpty() {
+		t.Fatalf("EmptyEffects should be empty")
+	}
+	s := types.NewEffectSet(types.EffectIO, types.EffectTime)
+	if !s.Has(types.EffectIO) || !s.Has(types.EffectTime) {
+		t.Fatalf("expected io+time, got %s", s.String())
+	}
+	if s.Has(types.EffectFS) {
+		t.Fatalf("expected no fs label")
+	}
+	if got, want := s.String(), "io, time"; got != want {
+		t.Fatalf("String=%q want %q", got, want)
+	}
+	if got, want := types.EmptyEffects.String(), "pure"; got != want {
+		t.Fatalf("empty.String=%q want %q", got, want)
+	}
+}
+
+func TestEffectSet_Union_Subset(t *testing.T) {
+	a := types.NewEffectSet(types.EffectIO)
+	b := types.NewEffectSet(types.EffectFS)
+	c := a.Union(b)
+	if !a.IsSubset(c) || !b.IsSubset(c) {
+		t.Fatalf("union missing labels: %s", c.String())
+	}
+	if c.IsSubset(a) {
+		t.Fatalf("c={io,fs} should not be subset of {io}")
+	}
+}
+
+func TestParseEffectLabel(t *testing.T) {
+	for _, name := range []string{"io", "fs", "net", "time", "meta"} {
+		if _, ok := types.ParseEffectLabel(name); !ok {
+			t.Fatalf("expected %q to parse", name)
+		}
+	}
+	if _, ok := types.ParseEffectLabel("nope"); ok {
+		t.Fatalf("unknown label should fail")
+	}
+}
+
+func TestFuncTypePure(t *testing.T) {
+	pure := types.FuncType{Params: []types.Type{}, Return: types.IntType{}}
+	if !pure.Pure() {
+		t.Fatalf("empty Effects should be pure")
+	}
+	impure := types.FuncType{Params: []types.Type{}, Return: types.IntType{}, Effects: types.NewEffectSet(types.EffectIO)}
+	if impure.Pure() {
+		t.Fatalf("io should not be pure")
+	}
+}
+
+// TestDeclaredEffects_Accepted exercises MEP-15 Stage 2b: a function
+// that annotates an effect set the body actually produces should
+// type-check cleanly, and the declared set should appear on the
+// FuncType so callers see the published contract.
+func TestDeclaredEffects_Accepted(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+		fn   string
+		want types.EffectSet
+	}{
+		{"exact match", "fun greet(name: string) ! io { print(name) }", "greet", types.NewEffectSet(types.EffectIO)},
+		{"wider than body", "fun maybe_print(name: string) ! io, time { }", "maybe_print", types.NewEffectSet(types.EffectIO, types.EffectTime)},
+		{"declared without body effects", "fun reserve() ! fs { }", "reserve", types.NewEffectSet(types.EffectFS)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			prog, err := parser.ParseString(tc.src)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			env := types.NewEnv(nil)
+			if errs := types.Check(prog, env); len(errs) > 0 {
+				t.Fatalf("Check: %v", errs)
+			}
+			ty, err := env.GetVar(tc.fn)
+			if err != nil {
+				t.Fatalf("GetVar: %v", err)
+			}
+			ft := ty.(types.FuncType)
+			if ft.Effects != tc.want {
+				t.Fatalf("Effects=%s want %s", ft.Effects, tc.want)
+			}
+		})
+	}
+}
+
+// TestDeclaredEffects_Rejected exercises T065: when the inferred set
+// exceeds the declared annotation, type-check must fail.
+func TestDeclaredEffects_Rejected(t *testing.T) {
+	src := "fun stamp(): int ! io { return now() }"
+	prog, err := parser.ParseString(src)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	env := types.NewEnv(nil)
+	errs := types.Check(prog, env)
+	if len(errs) == 0 {
+		t.Fatalf("expected T065 diagnostic, got none")
+	}
+	found := false
+	for _, e := range errs {
+		if msg := e.Error(); contains(msg, "T065") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected T065 in %v", errs)
+	}
+}
+
+// TestDeclaredEffects_UnknownLabel exercises T064: an unknown label
+// in the annotation must surface a diagnostic rather than silently
+// expand the closed vocabulary.
+func TestDeclaredEffects_UnknownLabel(t *testing.T) {
+	src := "fun broken() ! quantum { }"
+	prog, err := parser.ParseString(src)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	env := types.NewEnv(nil)
+	errs := types.Check(prog, env)
+	found := false
+	for _, e := range errs {
+		if contains(e.Error(), "T064") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected T064 in %v", errs)
+	}
+}
+
+// TestFunExpr_DeclaredEffects exercises MEP-15 Stage 3b: a closure
+// (anonymous function expression) accepts the same `! eff, ...`
+// annotation as a top-level FunStmt, and the declared set propagates
+// to the FuncType produced by the let binding.
+func TestFunExpr_DeclaredEffects(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+		want types.EffectSet
+	}{
+		{"block body io", "let f = fun(name: string) ! io { print(name) }", types.NewEffectSet(types.EffectIO)},
+		{"expr body time", "let stamp = fun(): int64 ! time => now()", types.NewEffectSet(types.EffectTime)},
+		{"declared wider than body", "let noop = fun(name: string) ! io, fs { print(name) }", types.NewEffectSet(types.EffectIO, types.EffectFS)},
+		{"no annotation infers pure", "let id = fun(x: int): int => x", types.EmptyEffects},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			prog, err := parser.ParseString(tc.src)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			env := types.NewEnv(nil)
+			if errs := types.Check(prog, env); len(errs) > 0 {
+				t.Fatalf("Check: %v", errs)
+			}
+			target := tc.src[4:]
+			target = target[:indexOf(target, " ")]
+			ty, err := env.GetVar(target)
+			if err != nil {
+				t.Fatalf("GetVar(%q): %v", target, err)
+			}
+			ft, ok := ty.(types.FuncType)
+			if !ok {
+				t.Fatalf("expected FuncType, got %T", ty)
+			}
+			if ft.Effects != tc.want {
+				t.Fatalf("Effects=%s want %s", ft.Effects.String(), tc.want.String())
+			}
+		})
+	}
+}
+
+// TestFunExpr_UnknownEffectLabel exercises T064 on FunExpr: an unknown
+// label in the `!` annotation of an anonymous function must surface a
+// diagnostic.
+func TestFunExpr_UnknownEffectLabel(t *testing.T) {
+	src := "let f = fun(x: int): int ! quantum => x"
+	prog, err := parser.ParseString(src)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	env := types.NewEnv(nil)
+	errs := types.Check(prog, env)
+	for _, e := range errs {
+		if contains(e.Error(), "T064") {
+			return
+		}
+	}
+	t.Fatalf("expected T064 in %v", errs)
+}
+
+// TestFunExpr_EffectsExceedDeclared exercises T065 on FunExpr: when
+// the inferred body effects escape the declared upper bound, type
+// check must reject the closure.
+func TestFunExpr_EffectsExceedDeclared(t *testing.T) {
+	src := "let stamp = fun(): int64 ! io => now()"
+	prog, err := parser.ParseString(src)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	env := types.NewEnv(nil)
+	errs := types.Check(prog, env)
+	for _, e := range errs {
+		if contains(e.Error(), "T065") {
+			return
+		}
+	}
+	t.Fatalf("expected T065 in %v", errs)
+}
+
+// TestT066_ReservedForPurePositions pins the message contract for the
+// diagnostic MEP-15 reserves for `const` declarations and struct field
+// defaults. No surface emits T066 today, so the test renders the
+// template directly to lock in code, message, and help text.
+func TestT066_ReservedForPurePositions(t *testing.T) {
+	tpl, ok := types.Errors["T066"]
+	if !ok {
+		t.Fatalf("T066 missing from Errors map")
+	}
+	if tpl.Code != "T066" {
+		t.Fatalf("Code=%q want T066", tpl.Code)
+	}
+	d := tpl.New(lexer.Position{}, types.NewEffectSet(types.EffectIO).String(), "`const` initializer")
+	const wantMsg = "expression produces effect(s) io, not allowed in `const` initializer"
+	if d.Msg != wantMsg {
+		t.Fatalf("Msg=%q want %q", d.Msg, wantMsg)
+	}
+	if !contains(d.Help, "pure expression") {
+		t.Fatalf("Help missing `pure expression` hint: %q", d.Help)
+	}
+}
+
+// TestHOFCallbackEffects verifies MEP-15 E5: a call to a HOF that
+// receives a function-typed argument inherits the argument's effects at
+// the call site. Three scenarios:
+//   - literal FunExpr with !io body → call site inherits io
+//   - named function with !io effects → call site inherits io
+//   - literal FunExpr with pure body → call site stays pure
+func TestHOFCallbackEffects(t *testing.T) {
+	const src = `
+fun do_print(x: int): int { print(x); return x }
+fun apply(f: fun(int): int, x: int): int { return f(x) }
+fun hof_literal_io(): int   { return apply(fun(x: int): int { print(x); return x }, 5) }
+fun hof_named_io(): int     { return apply(do_print, 5) }
+fun hof_literal_pure(): int { return apply(fun(x: int): int { return x * 2 }, 5) }
+`
+	prog, err := parser.ParseString(src)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	env := types.NewEnv(nil)
+	if errs := types.Check(prog, env); len(errs) > 0 {
+		t.Fatalf("Check: %v", errs)
+	}
+	cases := []struct {
+		fn   string
+		want types.EffectSet
+	}{
+		{"hof_literal_io", types.NewEffectSet(types.EffectIO)},
+		{"hof_named_io", types.NewEffectSet(types.EffectIO)},
+		{"hof_literal_pure", types.EmptyEffects},
+	}
+	for _, tc := range cases {
+		t.Run(tc.fn, func(t *testing.T) {
+			v, err := env.GetVar(tc.fn)
+			if err != nil {
+				t.Fatalf("GetVar(%q): %v", tc.fn, err)
+			}
+			ft, ok := v.(types.FuncType)
+			if !ok {
+				t.Fatalf("expected FuncType for %q, got %T", tc.fn, v)
+			}
+			if ft.Effects != tc.want {
+				t.Fatalf("%s: got %s, want %s", tc.fn, ft.Effects, tc.want)
+			}
+		})
+	}
+}
+
+func contains(s, sub string) bool {
+	return len(s) >= len(sub) && indexOf(s, sub) >= 0
+}
+
+func indexOf(s, sub string) int {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return i
+		}
+	}
+	return -1
+}
+
+// TestInferFunctionEffects exercises the MEP-15 Stage 2 body walker
+// via the public Check pipeline. Each row registers a single function
+// and asserts the effect set that propagates back through the env
+// after Check completes the fixpoint sweep.
+func TestInferFunctionEffects(t *testing.T) {
+	cases := []struct {
+		name string
+		src  string
+		want types.EffectSet
+	}{
+		{
+			name: "pure_arith",
+			src:  "fun add(x: int, y: int): int { return x + y }",
+			want: types.EmptyEffects,
+		},
+		{
+			name: "print_propagates_io",
+			src:  "fun greet(name: string) { print(name) }",
+			want: types.NewEffectSet(types.EffectIO),
+		},
+		{
+			name: "now_propagates_time",
+			src:  "fun stamp(): int { return now() }",
+			want: types.NewEffectSet(types.EffectTime),
+		},
+		{
+			name: "eval_propagates_meta",
+			src:  "fun dyn(s: string): any { return eval(s) }",
+			want: types.NewEffectSet(types.EffectMeta),
+		},
+		{
+			name: "transitive_via_helper",
+			src: `
+fun shout(s: string) { print(s) }
+fun greet(name: string) { shout(name) }
+`,
+			want: types.NewEffectSet(types.EffectIO),
+		},
+		{
+			name: "union_of_branches",
+			src: `
+fun snapshot(name: string): int {
+  print(name)
+  return now()
+}
+`,
+			want: types.NewEffectSet(types.EffectIO, types.EffectTime),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			prog, err := parser.ParseString(tc.src)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			env := types.NewEnv(nil)
+			if errs := types.Check(prog, env); len(errs) > 0 {
+				t.Fatalf("Check: %v", errs)
+			}
+			target := "greet"
+			switch tc.name {
+			case "pure_arith":
+				target = "add"
+			case "now_propagates_time":
+				target = "stamp"
+			case "eval_propagates_meta":
+				target = "dyn"
+			case "union_of_branches":
+				target = "snapshot"
+			}
+			t2, err := env.GetVar(target)
+			if err != nil {
+				t.Fatalf("GetVar(%q): %v", target, err)
+			}
+			ft, ok := t2.(types.FuncType)
+			if !ok {
+				t.Fatalf("expected FuncType for %q, got %T", target, t2)
+			}
+			if ft.Effects != tc.want {
+				t.Fatalf("%s: Effects=%s want %s", tc.name, ft.Effects.String(), tc.want.String())
+			}
+		})
+	}
+}

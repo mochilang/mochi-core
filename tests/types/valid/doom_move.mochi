@@ -1,0 +1,11 @@
+import "core/doom/doom.mochi" as doom
+let map = [
+  "###",
+  "#.#",
+  "###",
+]
+// `doom.PI` is typed `any` through the extern import; cast until
+// MEP-10 B7 (#97) tightens extern signature inference.
+let pi: float = doom.PI as float
+let width = len(map)
+print(pi, width)
