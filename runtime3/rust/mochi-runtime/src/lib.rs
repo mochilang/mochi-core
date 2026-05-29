@@ -31,7 +31,7 @@ pub mod io {
             println!("{}", if f > 0.0 { "+Inf" } else { "-Inf" });
             return;
         }
-        if f.fract() == 0.0 && f >= -9007199254740992.0 && f <= 9007199254740992.0 {
+        if f.fract() == 0.0 && (-9007199254740992.0f64..=9007199254740992.0).contains(&f) {
             println!("{}", f as i64);
             return;
         }
@@ -158,8 +158,10 @@ pub mod stream {
     use std::collections::VecDeque;
     use std::rc::Rc;
 
+    type Subscribers<T> = Rc<RefCell<Vec<Rc<RefCell<VecDeque<T>>>>>>;
+
     pub struct Stream<T> {
-        subs: Rc<RefCell<Vec<Rc<RefCell<VecDeque<T>>>>>>,
+        subs: Subscribers<T>,
     }
 
     impl<T: Clone> Stream<T> {
@@ -346,12 +348,7 @@ pub mod fetch {
     }
 
     fn find_header_end(buf: &[u8]) -> Option<usize> {
-        for i in 0..buf.len().saturating_sub(3) {
-            if &buf[i..i + 4] == b"\r\n\r\n" {
-                return Some(i);
-            }
-        }
-        None
+        (0..buf.len().saturating_sub(3)).find(|&i| &buf[i..i + 4] == b"\r\n\r\n")
     }
 
     fn parse_status(headers: &str) -> Option<u16> {
